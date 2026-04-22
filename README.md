@@ -4,6 +4,9 @@ Mac App Compressor is a native macOS app for archiving rarely used apps so they 
 
 The UI is written in Swift. The archive/restore backend is implemented as a Rust companion binary that the Swift app invokes over a JSON command interface. That keeps the macOS UI native while moving the core compression workflow toward a backend that can be shared across future platforms.
 
+`swift build` and `swift run` now build the Rust backend automatically through a local SwiftPM build plugin.
+The plugin builds both Rust debug and release binaries, and the Swift app prefers the matching backend profile for debug vs. release app builds.
+
 It archives whole app bundles. It does not compress apps in place because changing files inside a signed `.app` can break code signatures, updates, or launch behavior.
 
 ## What It Does
@@ -49,15 +52,14 @@ The manifest is stored at:
 
 ```bash
 cd mac-app-compressor
-cargo build --manifest-path rust-backend/Cargo.toml
 swift build
+swift build -c release
 ```
 
 ## Run
 
 ```bash
 cd mac-app-compressor
-cargo build --manifest-path rust-backend/Cargo.toml
 swift run Compressor
 ```
 
@@ -72,7 +74,7 @@ cargo test --manifest-path rust-backend/Cargo.toml
 swift test
 ```
 
-If the Rust backend binary lives somewhere else, set `COMPRESSOR_BACKEND_BIN` to its absolute path before launching the Swift app.
+If you want the Swift app to use a backend binary from somewhere else, set `COMPRESSOR_BACKEND_BIN` to its absolute path before launching the app.
 
 ## Restore Behavior
 

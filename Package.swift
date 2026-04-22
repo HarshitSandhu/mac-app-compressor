@@ -12,11 +12,18 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "Compressor"
+            name: "Compressor",
+            plugins: [
+                .plugin(name: "BuildRustBackendPlugin")
+            ]
         ),
         .testTarget(
             name: "CompressorTests",
             dependencies: ["Compressor"]
+        ),
+        .plugin(
+            name: "BuildRustBackendPlugin",
+            capability: .buildTool()
         )
     ]
 )

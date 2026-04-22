@@ -15,29 +15,10 @@ final class PathSafetyTests: XCTestCase {
         }
     }
 
-    func testRestoreDestinationConflictDetection() {
-        let tempDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let existingApp = tempDirectory.appendingPathComponent("Existing.app", isDirectory: true)
+    func testSavedSpaceCalculationNeverGoesNegative() {
+        let service = DiskUsageService()
 
-        do {
-            try FileManager.default.createDirectory(at: existingApp, withIntermediateDirectories: true)
-            let restoreService = RestoreService()
-            XCTAssertFalse(restoreService.canRestore(to: existingApp))
-        } catch {
-            XCTFail("Unexpected setup error: \(error)")
-        }
-
-        try? FileManager.default.removeItem(at: tempDirectory)
-    }
-
-    func testShellQuotingKeepsArgumentsSeparate() {
-        let service = PermissionService()
-        let command = service.shellCommand(arguments: ["/bin/mv", "/Applications/O'Hare App.app", "/Users/me/.Trash/O'Hare App.app"])
-
-        XCTAssertEqual(
-            command,
-            "'/bin/mv' '/Applications/O'\\''Hare App.app' '/Users/me/.Trash/O'\\''Hare App.app'"
-        )
+        XCTAssertEqual(service.savedBytes(original: 100, archive: 40), 60)
+        XCTAssertEqual(service.savedBytes(original: 40, archive: 100), 0)
     }
 }

@@ -262,6 +262,10 @@ final class RustBackendClient {
 
         if let executableURL = Bundle.main.executableURL {
             for ancestor in ancestors(of: executableURL.deletingLastPathComponent()) {
+                if let pluginBuiltURL = pluginBuiltExecutableURL(under: ancestor) {
+                    return pluginBuiltURL
+                }
+
                 let candidates = [
                     ancestor.appendingPathComponent("rust-backend/target/debug/compressor-backend"),
                     ancestor.appendingPathComponent("rust-backend/target/release/compressor-backend")
@@ -278,6 +282,56 @@ final class RustBackendClient {
             status: 127,
             output: "Rust backend binary not found. Build it with `cargo build --manifest-path rust-backend/Cargo.toml` or set COMPRESSOR_BACKEND_BIN."
         )
+    }
+
+    private func pluginBuiltExecutableURL(under ancestor: URL) -> URL? {
+        let pluginsDirectory = ancestor.appendingPathComponent(".build/plugins", isDirectory: true)
+        guard fileManager.fileExists(atPath: pluginsDirectory.path),
+              let enumerator = fileManager.enumerator(
+                at: pluginsDirectory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+              ) else {
+            return nil
+        }
+
+        let preferredMarker = preferredPluginMarkerFileName
+        let fallbackMarkers = [
+            "compressor-backend-debug-path.txt",
+            "compressor-backend-release-path.txt"
+        ]
+
+        var discovered: [String: URL] = [:]
+        for case let fileURL as URL in enumerator {
+            let markerName = fileURL.lastPathComponent
+            guard markerName == preferredMarker || fallbackMarkers.contains(markerName),
+                  let path = try? String(contentsOf: fileURL).trimmingCharacters(in: .whitespacesAndNewlines),
+                  !path.isEmpty,
+                  fileManager.isExecutableFile(atPath: path) else {
+                continue
+            }
+            discovered[markerName] = URL(fileURLWithPath: path)
+        }
+
+        if let preferred = discovered[preferredMarker] {
+            return preferred
+        }
+
+        for marker in fallbackMarkers {
+            if let fallback = discovered[marker] {
+                return fallback
+            }
+        }
+
+        return nil
+    }
+
+    private var preferredPluginMarkerFileName: String {
+        #if DEBUG
+        return "compressor-backend-debug-path.txt"
+        #else
+        return "compressor-backend-release-path.txt"
+        #endif
     }
 
     private func ancestors(of start: URL) -> [URL] {
