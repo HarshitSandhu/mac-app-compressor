@@ -10,25 +10,18 @@ final class CompressorViewModel: ObservableObject {
     @Published private(set) var lastMessage: String?
     @Published private(set) var errorMessage: String?
 
-    private let manifestStore: ManifestStore
     private let appSelectionService: AppSelectionService
-    private let archiveService: ArchiveService
-    private let restoreService: RestoreService
+    private let backendClient: RustBackendClient
     private let diskUsageService: DiskUsageService
 
     init(
-        manifestStore: ManifestStore = ManifestStore(),
         appSelectionService: AppSelectionService = AppSelectionService(),
+        backendClient: RustBackendClient = RustBackendClient(),
         diskUsageService: DiskUsageService = DiskUsageService()
     ) {
-        self.manifestStore = manifestStore
         self.appSelectionService = appSelectionService
+        self.backendClient = backendClient
         self.diskUsageService = diskUsageService
-        self.archiveService = ArchiveService(
-            manifestStore: manifestStore,
-            diskUsageService: diskUsageService
-        )
-        self.restoreService = RestoreService(manifestStore: manifestStore)
         refresh()
     }
 
@@ -46,7 +39,7 @@ final class CompressorViewModel: ObservableObject {
 
     func refresh() {
         do {
-            apps = try manifestStore.load().apps.sorted {
+            apps = try backendClient.listApps().sorted {
                 $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
             }
             errorMessage = nil
@@ -86,7 +79,7 @@ final class CompressorViewModel: ObservableObject {
 
         Task {
             do {
-                try await restoreService.restore(app) { [weak self] title, detail in
+                try await backendClient.restore(app) { [weak self] title, detail in
                     Task { @MainActor in
                         self?.setProgress(title, detail)
                     }
@@ -104,8 +97,11 @@ final class CompressorViewModel: ObservableObject {
 
     func openArchiveFolder() {
         do {
-            try manifestStore.ensureDirectoriesExist()
-            NSWorkspace.shared.open(manifestStore.archiveDirectoryURL)
+            try FileManager.default.createDirectory(
+                at: BackendPaths.archiveDirectoryURL,
+                withIntermediateDirectories: true
+            )
+            NSWorkspace.shared.open(BackendPaths.archiveDirectoryURL)
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -148,7 +144,7 @@ final class CompressorViewModel: ObservableObject {
         do {
             try AppSelectionService.requireExistingApp(at: appURL)
             setProgress("Measuring \(appURL.lastPathComponent)", "Calculating the current app size.")
-            let originalSize = try archiveService.compressionSummary(for: appURL)
+            let originalSize = try backendClient.compressionSummary(for: appURL)
 
             guard confirmArchive(appURL: appURL, originalSize: originalSize) else {
                 setProgress("Ready", "Compression cancelled.")
@@ -156,7 +152,7 @@ final class CompressorViewModel: ObservableObject {
                 return
             }
 
-            let app = try await archiveService.archive(appURL: appURL) { [weak self] title, detail in
+            let app = try await backendClient.archive(appURL: appURL) { [weak self] title, detail in
                 Task { @MainActor in
                     self?.setProgress(title, detail)
                 }
@@ -181,7 +177,7 @@ final class CompressorViewModel: ObservableObject {
         alert.messageText = "Compress \(appURL.lastPathComponent)?"
         alert.informativeText = """
         Original size: \(originalSize)
-        Archive location: \(manifestStore.archiveDirectoryURL.path)
+        Archive location: \(BackendPaths.archiveDirectoryURL.path)
 
         After verification, \(appURL.lastPathComponent) will be moved to Trash.
         """
