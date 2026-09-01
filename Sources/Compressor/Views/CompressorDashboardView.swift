@@ -97,6 +97,12 @@ struct CompressorDashboardView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+                if viewModel.isWorking {
+                    Button("Cancel") {
+                        viewModel.cancel()
+                    }
+                }
             }
 
             VStack(alignment: .leading, spacing: 8) {
@@ -189,6 +195,11 @@ private struct ArchivedAppRow: View {
                 viewModel.restore(app)
             }
             .disabled(!viewModel.canRestore(app))
+
+            Button("Remove") {
+                viewModel.remove(app)
+            }
+            .disabled(viewModel.isWorking)
         }
         .padding(.vertical, 4)
     }

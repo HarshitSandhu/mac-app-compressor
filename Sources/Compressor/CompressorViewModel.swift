@@ -87,6 +87,12 @@ final class CompressorViewModel: ObservableObject {
                 refresh()
                 lastMessage = "\(app.displayName) restored to \(app.originalPath)."
                 setProgress("Restore complete", "The archive was left in place.")
+            } catch CompressorError.cancelled {
+                refresh()
+                report(
+                    cancellation: "Restore cancelled",
+                    detail: "\(app.displayName) can be restored again from its archive."
+                )
             } catch {
                 errorMessage = error.localizedDescription
                 setProgress("Restore failed", error.localizedDescription)
@@ -128,11 +134,42 @@ final class CompressorViewModel: ObservableObject {
         FileManager.default.fileExists(atPath: app.archivePath)
     }
 
+    /// Deliberately not gated on status. Archives survive a restore, so a restored
+    /// app whose copy was deleted can be restored again - and a failed or
+    /// interrupted attempt stays retryable instead of being stuck forever.
     func canRestore(_ app: ManagedApp) -> Bool {
-        app.status == .archived
-            && archiveExists(for: app)
+        archiveExists(for: app)
             && !FileManager.default.fileExists(atPath: app.originalPath)
             && !isWorking
+    }
+
+    func cancel() {
+        guard isWorking else {
+            return
+        }
+        setProgress("Cancelling", "Stopping the current operation.")
+        backendClient.cancel()
+    }
+
+    func remove(_ app: ManagedApp) {
+        guard !isWorking else {
+            return
+        }
+
+        guard let deleteArchive = confirmRemove(app) else {
+            return
+        }
+
+        do {
+            try backendClient.remove(app, deleteArchive: deleteArchive)
+            refresh()
+            lastMessage = deleteArchive
+                ? "\(app.displayName) and its archive were removed."
+                : "\(app.displayName) was removed from the list. Its archive was kept."
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     private func archive(appURL: URL) async {
@@ -144,7 +181,7 @@ final class CompressorViewModel: ObservableObject {
         do {
             try AppSelectionService.requireExistingApp(at: appURL)
             setProgress("Measuring \(appURL.lastPathComponent)", "Calculating the current app size.")
-            let originalSize = try backendClient.compressionSummary(for: appURL)
+            let originalSize = formattedBytes(try backendClient.compressionSummary(for: appURL))
 
             guard confirmArchive(appURL: appURL, originalSize: originalSize) else {
                 setProgress("Ready", "Compression cancelled.")
@@ -164,12 +201,71 @@ final class CompressorViewModel: ObservableObject {
                 "Compression complete",
                 "Original: \(formattedBytes(app.originalSizeBytes))  Archive: \(formattedBytes(app.archiveSizeBytes))"
             )
+        } catch CompressorError.cancelled {
+            refresh()
+            report(cancellation: "Compression cancelled", detail: "\(appURL.lastPathComponent) was left in place.")
         } catch {
             errorMessage = error.localizedDescription
             setProgress("Compression failed", error.localizedDescription)
         }
 
         isWorking = false
+    }
+
+    /// Cancelling is a normal outcome, so it reports as a message rather than an error.
+    private func report(cancellation title: String, detail: String) {
+        lastMessage = detail
+        errorMessage = nil
+        setProgress(title, detail)
+    }
+
+    /// Returns nil when the user cancels, otherwise whether to delete the archive file.
+    private func confirmRemove(_ app: ManagedApp) -> Bool? {
+        let archivePresent = archiveExists(for: app)
+        let originalPresent = FileManager.default.fileExists(atPath: app.originalPath)
+
+        let alert = NSAlert()
+        alert.messageText = "Remove \(app.displayName) from Compressor?"
+
+        if archivePresent && !originalPresent {
+            // The archive holds the only copy still under Compressor's control.
+            alert.informativeText = """
+            \(app.displayName) is not at \(app.originalPath), so its archive is the \
+            only copy Compressor knows about.
+
+            Deleting the archive cannot be undone.
+            """
+            alert.alertStyle = .warning
+        } else if archivePresent {
+            alert.informativeText = """
+            \(app.displayName) is already at \(app.originalPath).
+
+            The archive at \(app.archivePath) is no longer needed unless you want \
+            to keep it.
+            """
+            alert.alertStyle = .informational
+        } else {
+            alert.informativeText = """
+            The archive for \(app.displayName) is already missing, so only the \
+            list entry will be removed.
+            """
+            alert.alertStyle = .informational
+        }
+
+        alert.addButton(withTitle: "Remove Entry Only")
+        if archivePresent {
+            alert.addButton(withTitle: "Remove and Delete Archive")
+        }
+        alert.addButton(withTitle: "Cancel")
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return false
+        case .alertSecondButtonReturn where archivePresent:
+            return true
+        default:
+            return nil
+        }
     }
 
     private func confirmArchive(appURL: URL, originalSize: String) -> Bool {

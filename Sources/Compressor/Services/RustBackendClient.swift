@@ -16,9 +16,14 @@ private struct BackendEvent: Decodable {
     let app: ManagedApp?
 }
 
-private final class StreamingCommandState: @unchecked Sendable {
+/// Buffers raw bytes rather than decoded text. A pipe read can end partway through
+/// a multi-byte UTF-8 character - decoding each chunk on arrival turned those split
+/// characters into `U+FFFD` permanently, corrupting non-ASCII app names.
+final class StreamingCommandState: @unchecked Sendable {
+    private static let newline = UInt8(ascii: "\n")
+
     private let lock = NSLock()
-    private var stdoutBuffer = ""
+    private var stdoutBuffer = Data()
     private var stderrData = Data()
     private var sawResult = false
     private var finalApp: ManagedApp?
@@ -29,7 +34,7 @@ private final class StreamingCommandState: @unchecked Sendable {
         progress: (@Sendable (_ title: String, _ detail: String) -> Void)?
     ) {
         lock.lock()
-        stdoutBuffer += String(decoding: data, as: UTF8.self)
+        stdoutBuffer.append(data)
         parseAvailableLines(progress: progress)
         lock.unlock()
     }
@@ -42,10 +47,10 @@ private final class StreamingCommandState: @unchecked Sendable {
 
     func finish(progress: (@Sendable (_ title: String, _ detail: String) -> Void)?) {
         lock.lock()
-        let trailingStdout = stdoutBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trailingStdout.isEmpty {
-            handle(line: trailingStdout, progress: progress)
-            stdoutBuffer = ""
+        let trailing = stdoutBuffer
+        stdoutBuffer.removeAll()
+        if !trailing.isEmpty {
+            handle(lineData: trailing, progress: progress)
         }
         lock.unlock()
     }
@@ -60,22 +65,28 @@ private final class StreamingCommandState: @unchecked Sendable {
     private func parseAvailableLines(
         progress: (@Sendable (_ title: String, _ detail: String) -> Void)?
     ) {
-        while let newlineRange = stdoutBuffer.range(of: "\n") {
-            let line = String(stdoutBuffer[..<newlineRange.lowerBound])
-            stdoutBuffer.removeSubrange(...newlineRange.lowerBound)
-            if line.isEmpty {
+        while let newlineIndex = stdoutBuffer.firstIndex(of: Self.newline) {
+            let lineData = Data(stdoutBuffer[stdoutBuffer.startIndex..<newlineIndex])
+            stdoutBuffer.removeSubrange(stdoutBuffer.startIndex...newlineIndex)
+            if lineData.isEmpty {
                 continue
             }
-            handle(line: line, progress: progress)
+            handle(lineData: lineData, progress: progress)
         }
     }
 
     private func handle(
-        line: String,
+        lineData: Data,
         progress: (@Sendable (_ title: String, _ detail: String) -> Void)?
     ) {
+        let trimmed = String(decoding: lineData, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return
+        }
+
         do {
-            let event = try RustBackendClient.decodeEvent(from: line)
+            let event = try RustBackendClient.decodeEvent(from: trimmed)
             switch event.event {
             case "progress":
                 if let title = event.title, let detail = event.detail {
@@ -93,9 +104,87 @@ private final class StreamingCommandState: @unchecked Sendable {
     }
 }
 
+struct BackendRemoveResponse: Decodable {
+    let removed: Bool
+}
+
+/// Tracks the backend process for the operation in flight so it can be cancelled.
+/// The backend makes itself a process-group leader, so signalling the group reaches
+/// the long-running tool it spawned (hdiutil, ditto) as well as the backend itself.
+private final class BackendProcessHandle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    /// Returns false when cancellation arrived before the process started, so the
+    /// caller can avoid launching work the user already backed out of.
+    func adopt(_ process: Process) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !cancelled else {
+            return false
+        }
+        self.process = process
+        return true
+    }
+
+    func release() {
+        lock.lock()
+        process = nil
+        lock.unlock()
+    }
+
+    func beginOperation() {
+        lock.lock()
+        cancelled = false
+        process = nil
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let identifier = process?.processIdentifier
+        lock.unlock()
+
+        signal(identifier)
+    }
+
+    /// A cancel that lands between `adopt` and `run` has no pid to signal yet.
+    /// Calling this once the process is running delivers it.
+    func signalIfCancelled() {
+        lock.lock()
+        let shouldSignal = cancelled
+        let identifier = process?.processIdentifier
+        lock.unlock()
+
+        guard shouldSignal else {
+            return
+        }
+        signal(identifier)
+    }
+
+    private func signal(_ identifier: pid_t?) {
+        guard let identifier, identifier > 0 else {
+            return
+        }
+        // The backend makes itself a process-group leader, so this reaches the
+        // hdiutil or ditto run it is currently waiting on.
+        killpg(identifier, SIGINT)
+    }
+
+    var wasCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+}
+
 final class RustBackendClient {
     private let fileManager: FileManager
     private let baseDirectoryURL: URL
+    private let processHandle = BackendProcessHandle()
 
     init(
         fileManager: FileManager = .default,
@@ -103,6 +192,11 @@ final class RustBackendClient {
     ) {
         self.fileManager = fileManager
         self.baseDirectoryURL = baseDirectoryURL
+    }
+
+    /// Signals the running archive or restore. Safe to call when nothing is running.
+    func cancel() {
+        processHandle.cancel()
     }
 
     func listApps() throws -> [ManagedApp] {
@@ -113,12 +207,27 @@ final class RustBackendClient {
         return response.apps
     }
 
-    func compressionSummary(for appURL: URL) throws -> String {
+    /// Returns raw bytes rather than the backend's preformatted string so that every
+    /// size in the UI runs through one formatter.
+    func compressionSummary(for appURL: URL) throws -> Int64 {
         let response: BackendSummaryResponse = try runJSONCommand(arguments: [
             "summary",
             "--app-path", appURL.standardizedFileURL.path
         ])
-        return response.formatted
+        return response.sizeBytes
+    }
+
+    func remove(_ app: ManagedApp, deleteArchive: Bool) throws {
+        var arguments = [
+            "remove",
+            "--base-dir", baseDirectoryURL.path,
+            "--app-id", app.id.uuidString
+        ]
+        if deleteArchive {
+            arguments.append("--delete-archive")
+        }
+
+        let _: BackendRemoveResponse = try runJSONCommand(arguments: arguments)
     }
 
     func archive(
@@ -168,11 +277,16 @@ final class RustBackendClient {
         progress: (@Sendable (_ title: String, _ detail: String) -> Void)?
     ) async throws -> ManagedApp? {
         let executableURL = try backendExecutableURL()
+        let handle = processHandle
+        handle.beginOperation()
+
+        defer { handle.release() }
 
         return try await Task.detached(priority: .userInitiated) { [executableURL] in
             try Self.runStreamingProcess(
                 executableURL: executableURL,
                 arguments: arguments,
+                handle: handle,
                 progress: progress
             )
         }.value
@@ -181,6 +295,7 @@ final class RustBackendClient {
     private static func runStreamingProcess(
         executableURL: URL,
         arguments: [String],
+        handle: BackendProcessHandle,
         progress: (@Sendable (_ title: String, _ detail: String) -> Void)?
     ) throws -> ManagedApp? {
             let process = Process()
@@ -210,7 +325,12 @@ final class RustBackendClient {
                 state.appendStderr(data)
             }
 
+            guard handle.adopt(process) else {
+                throw CompressorError.cancelled
+            }
+
             try process.run()
+            handle.signalIfCancelled()
             process.waitUntilExit()
 
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
@@ -218,6 +338,14 @@ final class RustBackendClient {
             state.finish(progress: progress)
 
             let snapshot = state.snapshot()
+
+            // Checked ahead of the parse error, because a cancelled run fails with
+            // whatever the signalled tool reported and that is not worth showing.
+            // A clean exit still counts as success: a cancel that arrives after the
+            // backend has already finished its work did not actually stop anything.
+            if handle.wasCancelled && process.terminationStatus != 0 {
+                throw CompressorError.cancelled
+            }
 
             if let error = snapshot.error {
                 throw error

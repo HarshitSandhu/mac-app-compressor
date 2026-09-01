@@ -12,6 +12,7 @@ enum CompressorError: LocalizedError, Equatable {
     case appNotFoundInMountedArchive(String)
     case manifestCorrupt(String)
     case trashMoveFailed(String)
+    case cancelled
 
     var errorDescription: String? {
         switch self {
@@ -37,6 +38,8 @@ enum CompressorError: LocalizedError, Equatable {
             return "The Compressor manifest could not be read: \(reason)"
         case .trashMoveFailed(let path):
             return "The app could not be moved to Trash: \(path)"
+        case .cancelled:
+            return "Cancelled."
         }
     }
 }
