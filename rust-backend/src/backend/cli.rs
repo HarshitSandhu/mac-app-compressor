@@ -1,15 +1,18 @@
 use anyhow::{Context, Result, anyhow, bail};
-use libc::{W_OK, access};
+use libc::{SIGINT, SIGTERM, W_OK, access, setpgid, signal};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub fn run() -> Result<()> {
+    install_cancellation_handlers();
+
     let mut args = env::args().skip(1);
     let Some(command) = args.next() else {
         bail!("missing command");
@@ -43,6 +46,12 @@ pub fn run() -> Result<()> {
             let mut backend = CompressorBackend::new(options.base_dir);
             backend.restore(options.app_id)?;
             emit_result::<ManagedApp>(None)?;
+        }
+        "remove" => {
+            let options = RemoveOptions::parse(args.collect())?;
+            let backend = CompressorBackend::new(options.base_dir);
+            backend.remove(options.app_id, options.delete_archive)?;
+            write_json(&RemoveResponse { removed: true })?;
         }
         _ => bail!("unknown command: {command}"),
     }
@@ -134,6 +143,42 @@ impl RestoreOptions {
     }
 }
 
+#[derive(Debug)]
+struct RemoveOptions {
+    base_dir: PathBuf,
+    app_id: Uuid,
+    delete_archive: bool,
+}
+
+impl RemoveOptions {
+    fn parse(args: Vec<String>) -> Result<Self> {
+        let mut base_dir = None;
+        let mut app_id = None;
+        let mut delete_archive = false;
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--base-dir" => {
+                    base_dir = Some(PathBuf::from(next_arg(&mut iter, "--base-dir")?));
+                }
+                "--app-id" => {
+                    app_id = Some(Uuid::parse_str(&next_arg(&mut iter, "--app-id")?)?);
+                }
+                "--delete-archive" => {
+                    delete_archive = true;
+                }
+                other => bail!("unknown argument: {other}"),
+            }
+        }
+
+        Ok(Self {
+            base_dir: base_dir.unwrap_or_else(default_base_directory),
+            app_id: app_id.context("missing --app-id")?,
+            delete_archive,
+        })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct ManagedApp {
@@ -214,6 +259,12 @@ impl ArchiveManifest {
     fn app_by_id(&self, id: Uuid) -> Option<&ManagedApp> {
         self.apps.iter().find(|app| app.id == id)
     }
+
+    fn remove(&mut self, id: Uuid) -> bool {
+        let before = self.apps.len();
+        self.apps.retain(|app| app.id != id);
+        self.apps.len() != before
+    }
 }
 
 struct ManifestStore {
@@ -267,18 +318,24 @@ impl CompressorBackend {
     fn archive(&mut self, app_path: &Path) -> Result<ManagedApp> {
         let app_path = normalized_path(app_path);
         emit_progress(
-            &format!("Validating {}", app_path.file_name().unwrap_or_default().to_string_lossy()),
+            &format!(
+                "Validating {}",
+                app_path.file_name().unwrap_or_default().to_string_lossy()
+            ),
             "Checking the selected application.",
         )?;
         validate_existing_app(&app_path)?;
 
-        let manifest = self.store.load()?;
+        let mut manifest = self.store.load()?;
         if manifest.archived_app_for_original_path(&app_path).is_some() {
             bail!("This app is already archived: {}", app_path.display());
         }
 
         emit_progress(
-            &format!("Measuring {}", app_path.file_name().unwrap_or_default().to_string_lossy()),
+            &format!(
+                "Measuring {}",
+                app_path.file_name().unwrap_or_default().to_string_lossy()
+            ),
             "Calculating the original size.",
         )?;
         let original_size = size_of_item(&app_path)?;
@@ -295,56 +352,104 @@ impl CompressorBackend {
             .to_string_lossy()
             .to_string();
 
+        bail_if_cancelled()?;
         emit_progress(
             &format!("Compressing {display_name}"),
             "Creating a compressed archive. Large apps can take a while.",
         )?;
-        run_command(
-            "/usr/bin/hdiutil",
-            &[
-                "create",
-                "-srcfolder",
-                app_path.to_str().unwrap_or_default(),
-                "-format",
-                "ULFO",
-                "-volname",
-                &volume_name,
-                archive_path.to_str().unwrap_or_default(),
-            ],
-        )?;
 
-        emit_progress(
-            &format!("Verifying {display_name}"),
-            "Checking that the archive can be read.",
-        )?;
-        verify_archive(&archive_path)?;
-        let archive_size = size_of_item(&archive_path)?;
+        let build_result = (|| -> Result<ManagedApp> {
+            run_command(
+                "/usr/bin/hdiutil",
+                &[
+                    "create",
+                    "-srcfolder",
+                    app_path.to_str().unwrap_or_default(),
+                    "-format",
+                    "ULFO",
+                    "-volname",
+                    &volume_name,
+                    archive_path.to_str().unwrap_or_default(),
+                ],
+            )?;
 
-        let app = ManagedApp {
-            id: app_id,
-            display_name: display_name.clone(),
-            bundle_identifier: bundle_identifier(&app_path)?,
-            original_path: app_path.to_string_lossy().to_string(),
-            archive_path: archive_path.to_string_lossy().to_string(),
-            original_size_bytes: original_size,
-            archive_size_bytes: archive_size,
-            created_at: iso8601_now(),
-            last_restored_at: None,
-            status: CompressionStatus::Archived,
+            bail_if_cancelled()?;
+            emit_progress(
+                &format!("Verifying {display_name}"),
+                "Checking that the archive can be read.",
+            )?;
+            verify_archive(&archive_path)?;
+            let archive_size = size_of_item(&archive_path)?;
+
+            Ok(ManagedApp {
+                id: app_id,
+                display_name: display_name.clone(),
+                bundle_identifier: bundle_identifier(&app_path)?,
+                original_path: app_path.to_string_lossy().to_string(),
+                archive_path: archive_path.to_string_lossy().to_string(),
+                original_size_bytes: original_size,
+                archive_size_bytes: archive_size,
+                created_at: iso8601_now(),
+                last_restored_at: None,
+                status: CompressionStatus::Archived,
+            })
+        })();
+
+        let app = match build_result {
+            Ok(app) => app,
+            Err(error) => {
+                // A half-written archive would be disk usage that nothing tracks
+                // and the UI has no way to show, so drop it before returning.
+                let _ = fs::remove_file(&archive_path);
+                return Err(describe_cancellation(error));
+            }
         };
+
+        // Record the archive before the original is touched. If this process dies
+        // in between, the manifest points at an app that is still in place - which
+        // the user can see and remove. The reverse order would strand the archive
+        // with the only copy of the app sitting in Trash.
+        emit_progress("Updating archive list", "Saving Compressor's manifest.")?;
+        manifest.upsert(app.clone());
+        self.store.save(&manifest)?;
 
         emit_progress(
             &format!("Moving {display_name} to Trash"),
             "The archive is verified. Removing the original app.",
         )?;
-        move_to_trash(&app_path)?;
-
-        emit_progress("Updating archive list", "Saving Compressor's manifest.")?;
-        let mut manifest = manifest;
-        manifest.upsert(app.clone());
-        self.store.save(&manifest)?;
+        if let Err(error) = move_to_trash(&app_path) {
+            self.roll_back_archive(app.id, &archive_path);
+            return Err(describe_cancellation(error));
+        }
 
         Ok(app)
+    }
+
+    fn roll_back_archive(&self, app_id: Uuid, archive_path: &Path) {
+        if let Ok(mut manifest) = self.store.load() {
+            manifest.remove(app_id);
+            let _ = self.store.save(&manifest);
+        }
+        let _ = fs::remove_file(archive_path);
+    }
+
+    fn remove(&self, app_id: Uuid, delete_archive: bool) -> Result<()> {
+        let mut manifest = self.store.load()?;
+        let app = manifest
+            .app_by_id(app_id)
+            .cloned()
+            .with_context(|| format!("app not found: {app_id}"))?;
+
+        if delete_archive {
+            let archive_path = PathBuf::from(&app.archive_path);
+            if archive_path.exists() {
+                fs::remove_file(&archive_path)
+                    .with_context(|| format!("failed to delete {}", archive_path.display()))?;
+            }
+        }
+
+        manifest.remove(app_id);
+        self.store.save(&manifest)
     }
 
     fn restore(&mut self, app_id: Uuid) -> Result<()> {
@@ -373,25 +478,10 @@ impl CompressorBackend {
         manifest.update_status(app.id, CompressionStatus::Restoring, None)?;
         self.store.save(&manifest)?;
 
-        emit_progress("Mounting archive", "Opening the compressed disk image.")?;
-        let mount_point = attach_archive(&archive_path)?;
-        let restore_result = (|| -> Result<()> {
-            emit_progress(
-                "Finding app",
-                &format!("Locating {} in the mounted archive.", app.display_name),
-            )?;
-            let source_url = app_source_in_mount(&mount_point, &app.display_name)?;
-
-            emit_progress(
-                &format!("Restoring {}", app.display_name),
-                "Copying the app back to its original location.",
-            )?;
-            copy_with_ditto(&source_url, &destination_path)?;
-
-            emit_progress("Cleaning up", "Detaching the mounted archive.")?;
-            detach_archive(&mount_point)?;
-            Ok(())
-        })();
+        // Every fallible step lives inside this call. Mounting used to sit outside
+        // it, so a failed attach returned early and left the app pinned at
+        // Restoring with no way to retry.
+        let restore_result = restore_from_archive(&app, &archive_path, &destination_path);
 
         match restore_result {
             Ok(()) => {
@@ -401,15 +491,67 @@ impl CompressorBackend {
                 Ok(())
             }
             Err(error) => {
-                let _ = detach_archive(&mount_point);
                 if let Ok(mut manifest) = self.store.load() {
                     let _ = manifest.update_status(app.id, CompressionStatus::Failed, None);
                     let _ = self.store.save(&manifest);
                 }
-                Err(error)
+                Err(describe_cancellation(error))
             }
         }
     }
+}
+
+fn restore_from_archive(
+    app: &ManagedApp,
+    archive_path: &Path,
+    destination_path: &Path,
+) -> Result<()> {
+    bail_if_cancelled()?;
+    emit_progress("Mounting archive", "Opening the compressed disk image.")?;
+    let mount_point = attach_archive(archive_path)?;
+
+    let copy_result = (|| -> Result<()> {
+        emit_progress(
+            "Finding app",
+            &format!("Locating {} in the mounted archive.", app.display_name),
+        )?;
+        let source_url = app_source_in_mount(&mount_point, &app.display_name)?;
+
+        bail_if_cancelled()?;
+        emit_progress(
+            &format!("Restoring {}", app.display_name),
+            "Copying the app back to its original location.",
+        )?;
+        copy_with_ditto(&source_url, destination_path)
+    })();
+
+    emit_progress("Cleaning up", "Detaching the mounted archive.")?;
+    let detach_result = detach_archive(&mount_point);
+
+    if let Err(error) = copy_result {
+        // The destination was confirmed empty before the copy started, so whatever
+        // is there now is our own half-written bundle.
+        remove_partial_destination(destination_path);
+        return Err(error);
+    }
+
+    detach_result
+}
+
+fn remove_partial_destination(destination_path: &Path) {
+    if !destination_path.exists() {
+        return;
+    }
+
+    if fs::remove_dir_all(destination_path).is_ok() {
+        return;
+    }
+
+    let _ = run_privileged_shell_command(&shell_command([
+        "/bin/rm",
+        "-rf",
+        destination_path.to_str().unwrap_or_default(),
+    ]));
 }
 
 #[derive(Serialize)]
@@ -436,6 +578,50 @@ struct SummaryResponse {
 #[derive(Serialize)]
 struct ListResponse {
     apps: Vec<ManagedApp>,
+}
+
+#[derive(Serialize)]
+struct RemoveResponse {
+    removed: bool,
+}
+
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_cancel_signal(_signal: i32) {
+    CANCELLED.store(true, Ordering::SeqCst);
+}
+
+/// Becomes a process-group leader so the Swift app can signal this backend and
+/// every tool it spawns (hdiutil, ditto) with a single `killpg`. The signal is
+/// only recorded here - the spawned tool dies, its failure surfaces through the
+/// normal error path, and that path gets to clean up after itself.
+fn install_cancellation_handlers() {
+    unsafe {
+        setpgid(0, 0);
+        signal(SIGINT, handle_cancel_signal as *const () as usize);
+        signal(SIGTERM, handle_cancel_signal as *const () as usize);
+    }
+}
+
+fn cancellation_requested() -> bool {
+    CANCELLED.load(Ordering::SeqCst)
+}
+
+fn bail_if_cancelled() -> Result<()> {
+    if cancellation_requested() {
+        bail!("Cancelled");
+    }
+    Ok(())
+}
+
+/// A cancelled run fails with whatever error the killed tool produced, which is
+/// noise. Report the cancellation instead.
+fn describe_cancellation(error: anyhow::Error) -> anyhow::Error {
+    if cancellation_requested() {
+        anyhow!("Cancelled")
+    } else {
+        error
+    }
 }
 
 fn emit_progress(title: &str, detail: &str) -> Result<()> {
@@ -468,11 +654,13 @@ fn required_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result
     if next != name {
         bail!("expected {name}, got {next}");
     }
-    args.next().with_context(|| format!("missing value for {name}"))
+    args.next()
+        .with_context(|| format!("missing value for {name}"))
 }
 
 fn next_arg(iter: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
-    iter.next().with_context(|| format!("missing value for {name}"))
+    iter.next()
+        .with_context(|| format!("missing value for {name}"))
 }
 
 fn default_base_directory() -> PathBuf {
@@ -497,7 +685,12 @@ fn validate_existing_app(path: &Path) -> Result<()> {
 
 fn validate_app_path(path: &Path) -> Result<()> {
     let path_string = path.to_string_lossy();
-    if path.extension().and_then(|value| value.to_str()).unwrap_or_default().to_lowercase() != "app"
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_lowercase()
+        != "app"
     {
         bail!("Select a valid macOS application: {path_string}");
     }
@@ -542,7 +735,11 @@ fn bundle_identifier(app_path: &Path) -> Result<Option<String>> {
 
     let output = run_command(
         "/usr/bin/defaults",
-        &["read", info_path.to_str().unwrap_or_default(), "CFBundleIdentifier"],
+        &[
+            "read",
+            info_path.to_str().unwrap_or_default(),
+            "CFBundleIdentifier",
+        ],
     );
     match output {
         Ok(result) => {
@@ -588,12 +785,15 @@ fn size_of_item(path: &Path) -> Result<i64> {
     }
 }
 
+/// Decimal units, matching `ByteCountFormatter` with `.file` style on the Swift
+/// side and Finder itself. Binary units here made the confirmation dialog
+/// disagree with every size shown elsewhere in the app.
 fn format_bytes(bytes: i64) -> String {
     const UNITS: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
         unit += 1;
     }
 
@@ -640,15 +840,17 @@ fn can_write_parent(path: &Path) -> bool {
 
 fn move_to_trash(path: &Path) -> Result<()> {
     let trash_path = unique_trash_path(path);
-    if can_write_parent(path) {
-        if run_command(
+    if can_write_parent(path)
+        && run_command(
             "/bin/mv",
-            &[path.to_str().unwrap_or_default(), trash_path.to_str().unwrap_or_default()],
+            &[
+                path.to_str().unwrap_or_default(),
+                trash_path.to_str().unwrap_or_default(),
+            ],
         )
         .is_ok()
-        {
-            return Ok(());
-        }
+    {
+        return Ok(());
     }
 
     run_privileged_shell_command(&shell_command([
@@ -706,7 +908,11 @@ fn apple_script_string(value: &str) -> String {
 fn unique_trash_path(path: &Path) -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| ".".into());
     let trash_directory = PathBuf::from(home).join(".Trash");
-    let base_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let base_name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     let candidate = trash_directory.join(&base_name);
     if !candidate.exists() {
         return candidate;
@@ -733,7 +939,12 @@ fn attach_archive(archive_path: &Path) -> Result<PathBuf> {
     let plist = String::from_utf8_lossy(&output.stdout);
     parse_mount_point(&plist)
         .map(PathBuf::from)
-        .with_context(|| format!("The archive mounted, but no mount point was reported: {}", archive_path.display()))
+        .with_context(|| {
+            format!(
+                "The archive mounted, but no mount point was reported: {}",
+                archive_path.display()
+            )
+        })
 }
 
 fn detach_archive(mount_point: &Path) -> Result<()> {
@@ -789,7 +1000,9 @@ fn iso8601_now() -> String {
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
         .output();
     match output {
-        Ok(result) if result.status.success() => String::from_utf8_lossy(&result.stdout).trim().to_string(),
+        Ok(result) if result.status.success() => {
+            String::from_utf8_lossy(&result.stdout).trim().to_string()
+        }
         _ => "1970-01-01T00:00:00Z".to_string(),
     }
 }
@@ -825,5 +1038,84 @@ mod tests {
             shell_quote("/Applications/O'Hare App.app"),
             "'/Applications/O'\\''Hare App.app'"
         );
+    }
+
+    #[test]
+    fn formats_bytes_with_decimal_units() {
+        assert_eq!(format_bytes(512), "512 bytes");
+        assert_eq!(format_bytes(1_000), "1.0 KB");
+        assert_eq!(format_bytes(1_500_000), "1.5 MB");
+        assert_eq!(format_bytes(2_000_000_000), "2.0 GB");
+    }
+
+    #[test]
+    fn rejects_non_app_and_system_paths() {
+        assert!(validate_app_path(Path::new("/Applications/Foo.txt")).is_err());
+        assert!(validate_app_path(Path::new("/System/Applications/Calculator.app")).is_err());
+        assert!(validate_app_path(Path::new("/Applications/Foo.app")).is_ok());
+    }
+
+    fn sample_app(original_path: &str, status: CompressionStatus) -> ManagedApp {
+        ManagedApp {
+            id: Uuid::new_v4(),
+            display_name: "Foo.app".to_string(),
+            bundle_identifier: None,
+            original_path: original_path.to_string(),
+            archive_path: "/archives/foo.dmg".to_string(),
+            original_size_bytes: 100,
+            archive_size_bytes: 40,
+            created_at: iso8601_now(),
+            last_restored_at: None,
+            status,
+        }
+    }
+
+    #[test]
+    fn only_archived_entries_block_re_archiving() {
+        let mut manifest = ArchiveManifest::default();
+        manifest.upsert(sample_app(
+            "/Applications/Foo.app",
+            CompressionStatus::Restored,
+        ));
+        assert!(
+            manifest
+                .archived_app_for_original_path(Path::new("/Applications/Foo.app"))
+                .is_none()
+        );
+
+        manifest.upsert(sample_app(
+            "/Applications/Foo.app",
+            CompressionStatus::Archived,
+        ));
+        assert!(
+            manifest
+                .archived_app_for_original_path(Path::new("/Applications/Foo.app"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn upsert_replaces_matching_id_instead_of_appending() {
+        let mut manifest = ArchiveManifest::default();
+        let app = sample_app("/Applications/Foo.app", CompressionStatus::Archived);
+        manifest.upsert(app.clone());
+        manifest.upsert(app.with_status(CompressionStatus::Restored, None));
+
+        assert_eq!(manifest.apps.len(), 1);
+        assert_eq!(manifest.apps[0].status, CompressionStatus::Restored);
+    }
+
+    #[test]
+    fn remove_drops_only_the_requested_entry() {
+        let mut manifest = ArchiveManifest::default();
+        let first = sample_app("/Applications/Foo.app", CompressionStatus::Archived);
+        let second = sample_app("/Applications/Bar.app", CompressionStatus::Archived);
+        manifest.upsert(first.clone());
+        manifest.upsert(second.clone());
+
+        assert!(manifest.remove(first.id));
+        assert!(!manifest.remove(first.id));
+        assert_eq!(manifest.apps.len(), 1);
+        assert_eq!(manifest.apps[0].id, second.id);
     }
 }
