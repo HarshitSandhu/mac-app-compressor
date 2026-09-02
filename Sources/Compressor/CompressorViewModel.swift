@@ -80,8 +80,9 @@ final class CompressorViewModel: ObservableObject {
         Task {
             do {
                 try await backendClient.restore(app) { [weak self] title, detail in
+                    guard let self else { return }
                     Task { @MainActor in
-                        self?.setProgress(title, detail)
+                        self.setProgress(title, detail)
                     }
                 }
                 refresh()
@@ -190,8 +191,9 @@ final class CompressorViewModel: ObservableObject {
             }
 
             let app = try await backendClient.archive(appURL: appURL) { [weak self] title, detail in
+                guard let self else { return }
                 Task { @MainActor in
-                    self?.setProgress(title, detail)
+                    self.setProgress(title, detail)
                 }
             }
 
